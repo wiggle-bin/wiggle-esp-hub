@@ -5,7 +5,8 @@
 #include "env.h"
 
 // === CONFIG ===
-const char *serverBaseUrl = "http://homeassistant.local:8123/api/wiggle/upload";
+const char *imageUrl = "http://homeassistant.local:8123/api/wiggle/raw";
+const char *metadataUrl = "http://homeassistant.local:8123/api/wiggle/metadata";
 
 // Set the WiFi channel for ESP-NOW (must match sender)
 #define RECEIVER_WIFI_CHANNEL 9
@@ -18,11 +19,26 @@ const char *serverBaseUrl = "http://homeassistant.local:8123/api/wiggle/upload";
 
 // Buffer for incoming image
 uint8_t packedImage[DOWNSAMPLED_PACKED_SIZE];
-bool chunkReceived[128] = {0}; // Enough for 2400/150 = 16 chunks, but allow more
+bool chunkReceived[128] = {0}; // Enough for 2400/200 = 12 chunks, but allow more
 uint16_t totalChunks = 0;
 uint16_t chunksReceived = 0;
 bool receivingImage = false;
 volatile bool imageReadyToUpload = false;
+
+// Metadata from sender
+struct ReceivedMetadata {
+  uint16_t meanDiff;
+  uint8_t  maxDiff;
+  uint16_t changedPixelCount;
+  uint8_t  avgGrey;
+  bool     imageSent;
+};
+ReceivedMetadata latestMetadata = {0, 0, false};
+volatile bool metadataReadyToUpload = false;
+
+// Packet type bytes (must match sender)
+#define PACKET_TYPE_IMAGE    0x01
+#define PACKET_TYPE_METADATA 0x02
 
 // Unpack 4-bit grayscale to 8-bit
 void unpack_4bit(const uint8_t *src, uint8_t *dst, int num_pixels) {
@@ -37,9 +53,26 @@ void unpack_4bit(const uint8_t *src, uint8_t *dst, int num_pixels) {
 void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
   Serial.println("ESP-NOW packet received");
 
-  if (len < 4) return;
-  uint16_t chunk = incomingData[0] | (incomingData[1] << 8);
-  uint16_t tChunks = incomingData[2] | (incomingData[3] << 8);
+  if (len < 1) return;
+  uint8_t packetType = incomingData[0];
+
+  if (packetType == PACKET_TYPE_METADATA && len == 8) {
+    latestMetadata.meanDiff          = incomingData[1] | (incomingData[2] << 8);
+    latestMetadata.maxDiff           = incomingData[3];
+    latestMetadata.changedPixelCount = incomingData[4] | (incomingData[5] << 8);
+    latestMetadata.avgGrey           = incomingData[6];
+    latestMetadata.imageSent         = incomingData[7] != 0;
+    metadataReadyToUpload = true;
+    Serial.printf("Metadata received — meanDiff: %d, maxDiff: %d, changedPixels: %d, avgGrey: %d, imageSent: %d\n",
+                  latestMetadata.meanDiff, latestMetadata.maxDiff, latestMetadata.changedPixelCount,
+                  latestMetadata.avgGrey, latestMetadata.imageSent ? 1 : 0);
+    return;
+  }
+
+  if (packetType != PACKET_TYPE_IMAGE || len < 5) return;
+
+  uint16_t chunk   = incomingData[1] | (incomingData[2] << 8);
+  uint16_t tChunks = incomingData[3] | (incomingData[4] << 8);
   if (tChunks > 128) return; // Sanity check
 
   if (!receivingImage || tChunks != totalChunks) {
@@ -54,10 +87,10 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
   if (!chunkReceived[chunk]) {
     chunkReceived[chunk] = true;
     ++chunksReceived;
-    size_t offset = chunk * (len - 4);
-    size_t copyLen = len - 4;
+    size_t offset = chunk * (len - 5);
+    size_t copyLen = len - 5;
     if (offset + copyLen > DOWNSAMPLED_PACKED_SIZE) copyLen = DOWNSAMPLED_PACKED_SIZE - offset;
-    memcpy(packedImage + offset, incomingData + 4, copyLen);
+    memcpy(packedImage + offset, incomingData + 5, copyLen);
     Serial.printf("Chunk %d/%d received\n", chunk + 1, totalChunks);
   }
 
@@ -120,7 +153,7 @@ void loop() {
       Serial.println("WiFi connected, uploading image...");
       WiFiClient client;
       HTTPClient http;
-      http.begin(client, serverBaseUrl);
+      http.begin(client, imageUrl);
       http.addHeader("Content-Type", "application/octet-stream");
       int httpResponseCode = http.POST(packedImage, DOWNSAMPLED_PACKED_SIZE);
       if (httpResponseCode > 0) {
@@ -129,6 +162,30 @@ void loop() {
         Serial.printf("Send failed: %s\n", http.errorToString(httpResponseCode).c_str());
       }
       http.end();
+
+      // Upload metadata if available
+      if (metadataReadyToUpload) {
+        metadataReadyToUpload = false;
+        char jsonBuf[120];
+        snprintf(jsonBuf, sizeof(jsonBuf),
+                 "{\"mean_diff\":%d,\"max_diff\":%d,\"changed_pixels\":%d,\"avg_grey\":%d,\"image_sent\":%s}",
+                 latestMetadata.meanDiff,
+                 latestMetadata.maxDiff,
+                 latestMetadata.changedPixelCount,
+                 latestMetadata.avgGrey,
+                 latestMetadata.imageSent ? "true" : "false");
+        WiFiClient metaClient;
+        HTTPClient metaHttp;
+        metaHttp.begin(metaClient, metadataUrl);
+        metaHttp.addHeader("Content-Type", "application/json");
+        int metaResponse = metaHttp.POST((uint8_t *)jsonBuf, strlen(jsonBuf));
+        if (metaResponse > 0) {
+          Serial.printf("Metadata sent! Response: %d\n", metaResponse);
+        } else {
+          Serial.printf("Metadata send failed: %s\n", metaHttp.errorToString(metaResponse).c_str());
+        }
+        metaHttp.end();
+      }
     } else {
       Serial.println("WiFi connect failed, image not sent.");
     }
